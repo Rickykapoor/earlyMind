@@ -1,1 +1,11 @@
-datasets/
+datasets/eeg/helsinki_neonatal/
+datasets/mri/baby_open_brains/
+datasets/facial/hpo/
+datasets/processed/
+checkpoints/
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+.env
