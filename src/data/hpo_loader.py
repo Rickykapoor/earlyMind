@@ -133,12 +133,16 @@ def load_hpo_matrix(
     # Step 1: Load phenotype.hpoa
     # -------------------------------------------------------------------
     print("  Loading phenotype.hpoa …")
-    # File uses '#' character at start of header line
+    # Find the header row dynamically
+    skip = 0
     with open(phenotype_path, "r") as f:
-        first_line = f.readline()
+        for i, line in enumerate(f):
+            if line.startswith('DatabaseID') or line.startswith('#DatabaseID'):
+                skip = i
+                break
 
     sep = "\t"
-    df = pd.read_csv(phenotype_path, sep=sep, comment=None, low_memory=False)
+    df = pd.read_csv(phenotype_path, sep=sep, skiprows=skip, low_memory=False)
 
     # Handle comment character in header
     if df.columns[0].startswith("#"):
