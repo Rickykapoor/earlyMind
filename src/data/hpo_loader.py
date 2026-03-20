@@ -137,7 +137,7 @@ def load_hpo_matrix(
     skip = 0
     with open(phenotype_path, "r") as f:
         for i, line in enumerate(f):
-            if line.startswith('DatabaseID') or line.startswith('#DatabaseID'):
+            if 'DatabaseID' in line:
                 skip = i
                 break
 
