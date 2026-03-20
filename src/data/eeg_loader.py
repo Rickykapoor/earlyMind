@@ -26,12 +26,12 @@ mne.set_log_level("WARNING")
 
 SFREQ          = cfg.data.eeg_sample_rate       # 256 Hz
 EPOCH_SEC      = cfg.data.eeg_epoch_seconds      # 30 s
-OVERLAP        = cfg.data.eeg_epoch_overlap       # 0.5
-BANDPASS_LOW   = cfg.data.eeg_bandpass_low        # 0.5 Hz
-BANDPASS_HIGH  = cfg.data.eeg_bandpass_high       # 40.0 Hz
-NOTCH_FREQ     = cfg.data.eeg_notch_freq          # 50 Hz
-N_CHANNELS     = cfg.model.eeg_channels           # 19
-EPOCH_SAMPLES  = cfg.model.eeg_timesteps          # 7680 = 30s × 256Hz
+OVERLAP        = cfg.data.eeg_epoch_overlap      # 0.5
+BANDPASS_LOW   = cfg.data.eeg_bandpass_low       # 0.5 Hz
+BANDPASS_HIGH  = cfg.data.eeg_bandpass_high      # 40.0 Hz
+NOTCH_FREQ     = cfg.data.eeg_notch_freq         # 50 Hz
+N_CHANNELS     = cfg.model.eeg_channels          # 19
+EPOCH_SAMPLES  = cfg.model.eeg_timesteps         # 7680 = 30s x 256Hz
 
 BAND_FREQS = {
     "delta": (0.5, 4.0),
@@ -107,7 +107,7 @@ def epoch_raw(raw: mne.io.RawArray) -> np.ndarray:
 def _band_power(epoch_1d: np.ndarray, band: Tuple[float, float], sfreq: int) -> float:
     """
     Estimate bandpower of a 1D signal using Welch's method.
-    Returns power in µV²/Hz.
+    Returns power in uV^2/Hz.
     """
     from scipy.signal import welch
     fmin, fmax = band
@@ -119,13 +119,15 @@ def _band_power(epoch_1d: np.ndarray, band: Tuple[float, float], sfreq: int) -> 
 def _burst_suppression_ratio(epoch_1d: np.ndarray, threshold_uv: float = 5.0) -> float:
     """
     Burst-Suppression Ratio: fraction of samples with amplitude < threshold_uv.
-    Input is assumed to be in µV.
+    Input is assumed to be in uV.
     """
     suppressed = np.abs(epoch_1d) < threshold_uv
     return float(suppressed.mean())
 
 
-def _inter_burst_intervals(epoch_1d: np.ndarray, sfreq: int, threshold_uv: float = 5.0) -> Tuple[float, float]:
+def _inter_burst_intervals(
+    epoch_1d: np.ndarray, sfreq: int, threshold_uv: float = 5.0
+) -> Tuple[float, float]:
     """
     Compute mean and std of inter-burst intervals in seconds.
     A 'burst' is a contiguous region where |signal| >= threshold_uv.
@@ -139,7 +141,7 @@ def _inter_burst_intervals(epoch_1d: np.ndarray, sfreq: int, threshold_uv: float
         return (0.0, 0.0)
 
     # Align starts and ends
-    if burst_ends[0] < burst_starts[0]:
+    if len(burst_ends) > 0 and burst_ends[0] < burst_starts[0]:
         burst_ends = burst_ends[1:]
     min_len = min(len(burst_starts), len(burst_ends))
     burst_starts = burst_starts[:min_len]
@@ -150,7 +152,9 @@ def _inter_burst_intervals(epoch_1d: np.ndarray, sfreq: int, threshold_uv: float
     return (float(ibi_sec.mean()), float(ibi_sec.std()))
 
 
-def _spectral_edge_freq(epoch_1d: np.ndarray, sfreq: int, percentile: float = 95.0) -> float:
+def _spectral_edge_freq(
+    epoch_1d: np.ndarray, sfreq: int, percentile: float = 95.0
+) -> float:
     """
     SEF95: frequency below which `percentile`% of total power lies.
     """
@@ -167,14 +171,13 @@ def _spectral_edge_freq(epoch_1d: np.ndarray, sfreq: int, percentile: float = 95
 
 def extract_epoch_features(epoch: np.ndarray, sfreq: int = SFREQ) -> np.ndarray:
     """
-    Extract per-channel features for one epoch (shape: n_channels × n_samples).
-    Returns a 1D feature vector by averaging across channels where appropriate.
+    Extract per-channel features for one epoch (shape: n_channels x n_samples).
+    Returns a 1D feature vector (11 scalars) by averaging across channels.
 
-    Feature vector layout (per epoch):
+    Feature layout:
         delta_mean, theta_mean, alpha_mean, beta_mean,
         total_power_mean, bsr_mean, ibi_mean, ibi_std,
         sef95_mean, amp_mean_mean, amp_std_mean
-    → 11 scalar features per epoch
     """
     n_ch = epoch.shape[0]
 
@@ -190,9 +193,7 @@ def extract_epoch_features(epoch: np.ndarray, sfreq: int = SFREQ) -> np.ndarray:
         alpha_list.append(_band_power(sig, BAND_FREQS["alpha"], sfreq))
         beta_list.append(_band_power(sig, BAND_FREQS["beta"], sfreq))
 
-        total_pw = (
-            _band_power(sig, (BANDPASS_LOW, BANDPASS_HIGH), sfreq)
-        )
+        total_pw = _band_power(sig, (BANDPASS_LOW, BANDPASS_HIGH), sfreq)
         total_pw_list.append(total_pw)
 
         bsr_list.append(_burst_suppression_ratio(sig))
@@ -241,13 +242,17 @@ def process_eeg_dataset(
 ) -> Dict[str, dict]:
     """
     Process all EDF files in eeg_dir.
+
+    Helsinki Neonatal files are named like eeg10.edf, eeg12.edf, eeg14.edf.
+    Clinical CSV maps subject ID (numeric) to EEG filename stem via 'EEG file'
+    column (values like 'eeg10').
+
     Saves per subject:
-        output_dir/{subject}_features.npy  — (11,) tabular features
-        output_dir/{subject}_epochs.npy    — (n_epochs, 19, 7680) raw epochs
+        output_dir/{stem}_features.npy  -- (11,) tabular features
+        output_dir/{stem}_epochs.npy    -- (n_epochs, 19, 7680) raw epochs
+        output_dir/labels.csv           -- subject_id, label, dq
 
-    Also attempts to load labels from clinical_information.csv.
-
-    Returns dict: {subject_id: {"features": ..., "epochs": ..., "label": ..., "dq": ...}}
+    Returns dict: {stem: {"features":..., "epochs":..., "label":..., "dq":...}}
     """
     eeg_dir = Path(eeg_dir)
     output_dir = Path(output_dir)
@@ -257,58 +262,92 @@ def process_eeg_dataset(
     if len(edf_files) == 0:
         raise FileNotFoundError(f"No .edf files found in {eeg_dir}")
 
+    print(f"Found {len(edf_files)} EDF files: {[f.name for f in edf_files]}")
+
     # Load clinical labels if available
     label_df = None
-    clinical_csv = eeg_dir / "clinical_information.csv"
+    clinical_csv   = eeg_dir / "clinical_information.csv"
     annotations_csv = eeg_dir / "annotations_2017_A.csv"
 
     if clinical_csv.exists():
         try:
             label_df = parse_eeg_clinical_csv(str(clinical_csv))
+            print(f"  Clinical CSV loaded: {len(label_df)} subjects")
             if annotations_csv.exists():
                 label_df = add_seizure_labels(label_df, str(annotations_csv))
+            print(f"  Labels after seizure merge: {label_df['label'].sum()} ID-positive")
         except Exception as e:
             print(f"  [WARNING] Could not parse clinical CSV: {e}")
+            import traceback; traceback.print_exc()
+    else:
+        print(f"  [WARNING] clinical_information.csv not found in {eeg_dir}")
 
     results = {}
 
     for edf_path in edf_files:
-        subject_id = edf_path.stem  # e.g. "1", "2", "3"
-        print(f"  Processing EEG subject: {subject_id}")
+        stem = edf_path.stem    # e.g. "eeg10", "eeg12", "eeg14"
+        print(f"  Processing EEG: {edf_path.name}")
 
         try:
-            raw = load_edf(edf_path)
-            raw = preprocess_raw(raw)
-            epochs = epoch_raw(raw)       # (n_epochs, 19, 7680)
+            raw    = load_edf(edf_path)
+            raw    = preprocess_raw(raw)
+            epochs = epoch_raw(raw)              # (n_epochs, 19, 7680)
             feats  = extract_subject_features(epochs)  # (11,)
         except Exception as e:
             print(f"    [ERROR] Failed to process {edf_path.name}: {e}")
             continue
 
-        # Save
-        feat_path   = output_dir / f"{subject_id}_features.npy"
-        epoch_path  = output_dir / f"{subject_id}_epochs.npy"
+        # Save arrays
+        feat_path  = output_dir / f"{stem}_features.npy"
+        epoch_path = output_dir / f"{stem}_epochs.npy"
         np.save(str(feat_path),  feats)
         np.save(str(epoch_path), epochs)
 
-        # Attach labels
+        # --- Label matching ---
+        # EDF stem (e.g. "eeg10") matches clinical 'eeg_file' column (also "eeg10").
+        # Fall back: strip non-digits from stem ("10") and match numeric 'subject_id'.
         label, dq = 0, 85.0
+
         if label_df is not None:
-            match = label_df[label_df["subject_id"].str.contains(subject_id, case=False)]
-            if len(match) > 0:
+            match = pd.DataFrame()
+
+            # Primary: match via eeg_file column
+            if "eeg_file" in label_df.columns:
+                match = label_df[label_df["eeg_file"].str.lower() == stem.lower()]
+
+            # Fallback: match numeric part of filename against subject_id
+            if match.empty:
+                numeric_id = "".join(ch for ch in stem if ch.isdigit())
+                if numeric_id:
+                    match = label_df[label_df["subject_id"].astype(str) == numeric_id]
+
+            if not match.empty:
                 label = int(match.iloc[0]["label"])
                 dq    = float(match.iloc[0]["dq"])
+                print(f"    Matched: subject_id={match.iloc[0]['subject_id']}, "
+                      f"label={label}, dq={dq:.1f}")
+            else:
+                print(f"    [WARNING] No clinical match for '{stem}'. Defaulting label=0, dq=85")
 
-        results[subject_id] = {
-            "features": feats,
-            "epochs": epochs,
-            "label": label,
-            "dq": dq,
-            "feat_path": str(feat_path),
+        results[stem] = {
+            "features":   feats,
+            "epochs":     epochs,
+            "label":      label,
+            "dq":         dq,
+            "feat_path":  str(feat_path),
             "epoch_path": str(epoch_path),
         }
 
-    print(f"  EEG preprocessing complete: {len(results)} subjects → {output_dir}")
+    # Save labels CSV
+    if results:
+        label_rows = [
+            {"subject_id": sid, "label": v["label"], "dq": v["dq"]}
+            for sid, v in results.items()
+        ]
+        pd.DataFrame(label_rows).to_csv(output_dir / "labels.csv", index=False)
+        print(f"  Labels CSV saved: {output_dir / 'labels.csv'}")
+
+    print(f"  EEG preprocessing complete: {len(results)} subjects -> {output_dir}")
     return results
 
 
@@ -338,12 +377,12 @@ def augment_eeg_epochs(
     # 1. Gaussian noise
     x += rng.normal(0, 0.01, size=x.shape).astype(np.float32)
 
-    # 2. Channel dropout (zero 2–3 channels per sample)
+    # 2. Channel dropout (zero 2-3 channels per sample)
     n_drop = rng.integers(2, 4)
     drop_ch = rng.choice(C, size=n_drop, replace=False)
     x[:, drop_ch, :] = 0.0
 
-    # 3. Time shift ±50 samples
+    # 3. Time shift +/-50 samples
     shift = int(rng.integers(-50, 51))
     if shift > 0:
         x = np.concatenate([np.zeros((B, C, shift), dtype=np.float32), x[:, :, :-shift]], axis=2)
@@ -357,3 +396,45 @@ def augment_eeg_epochs(
     if single:
         x = x[0]
     return x
+
+
+# ---------------------------------------------------------------------------
+# EEG Seizure Dataset for encoder pretraining
+# ---------------------------------------------------------------------------
+
+class EEGSeizureDataset:
+    """
+    PyTorch Dataset returning (epoch_tensor, seizure_label) for pretraining.
+    epochs_npy : path to *_epochs.npy  -- shape (n_epochs, 19, 7680)
+    label      : 1 if this subject had seizures, 0 otherwise
+    augment    : apply augment_eeg_epochs during __getitem__
+    """
+
+    def __init__(
+        self,
+        records: List[dict],
+        augment: bool = False,
+    ):
+        import torch
+        self.augment = augment
+        self.samples: List[Tuple[np.ndarray, int]] = []
+        rng = np.random.default_rng(42)
+
+        for rec in records:
+            ep_path = rec.get("epoch_path", "")
+            label   = int(rec.get("label", 0))
+            if not ep_path or not Path(ep_path).exists():
+                continue
+            epochs = np.load(ep_path)   # (n_epochs, 19, 7680)
+            for i in range(len(epochs)):
+                self.samples.append((epochs[i].astype(np.float32), label))
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        import torch
+        epoch, label = self.samples[idx]
+        if self.augment:
+            epoch = augment_eeg_epochs(epoch, rng=np.random.default_rng())
+        return torch.from_numpy(epoch), torch.tensor(label, dtype=torch.float32)

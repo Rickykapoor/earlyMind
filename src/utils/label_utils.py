@@ -21,86 +21,111 @@ def hie_grade_to_label_dq(
     hie_grade: Optional[int],
     has_seizures: bool = False,
     rng: Optional[np.random.Generator] = None,
-) -> tuple[int, float]:
+) -> tuple:
     """
     Map HIE grade integer (0–3) to binary risk label and a sampled DQ.
 
-    HIE grade 0 → label 0 (typical)
-    HIE grades 1–3 → label 1 (ID risk)
+    HIE grade 0 or None → label 0 (typical)
+    HIE grades 1–3      → label 1 (ID risk)
     Seizures add extra DQ penalty (handled in sample_dq).
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    if hie_grade is None or hie_grade == 0:
-        label = 0
-    else:
-        label = 1
-
+    label = 0 if (hie_grade is None or hie_grade == 0) else 1
     dq = sample_dq(label, hie_grade=hie_grade, has_seizures=has_seizures, rng=rng)
     return label, dq
+
+
+def _parse_hie_grade_from_text(diagnosis_text: str) -> Optional[int]:
+    """
+    Parse HIE grade (0–3) from free-text Diagnosis column.
+
+    Helsinki Neonatal dataset uses text like:
+      'mild/moderate asphyxia', 'severe asphyxia', 'prematurity',
+      'infarction', 'neonatal convulsions', NaN, etc.
+
+    Grade mapping:
+      None : unknown / NaN — treated as grade 0 by caller
+      1    : mild asphyxia, prematurity
+      2    : mild/moderate asphyxia, infarction, haemorrhage, neonatal convulsions
+      3    : severe asphyxia, diffuse edema
+    """
+    if not diagnosis_text or str(diagnosis_text).strip().lower() in ("nan", "none", ""):
+        return None  # unknown
+
+    diag = str(diagnosis_text).lower().strip()
+
+    if "severe asphyxia" in diag or "diffuse edema" in diag:
+        return 3
+    if "mild/moderate" in diag or "moderate asphyxia" in diag:
+        return 2
+    if "mild asphyxia" in diag:
+        return 1
+    if "infarction" in diag or "haemorrhage" in diag or "hemorrhage" in diag:
+        return 2
+    if "neonatal convulsions" in diag:
+        return 2
+    if "prematurity" in diag:
+        return 1
+    if "asphyxia" in diag:
+        return 1
+    return None
 
 
 def parse_eeg_clinical_csv(clinical_csv_path: str) -> pd.DataFrame:
     """
     Load clinical_information.csv from Helsinki Neonatal dataset.
-    Inspects columns dynamically and returns DataFrame with standardized columns:
-      subject_id, hie_grade (int 0–3), label (int 0/1), dq (float)
+
+    Actual columns: ID | EEG file | Gender | BW (g) | GA (weeks) | ... | Diagnosis | ...
+    Returns standardised DataFrame:
+      subject_id (str), eeg_file (str, e.g. 'eeg10'), hie_grade (int|None), label (int), dq (float)
     """
     df = pd.read_csv(clinical_csv_path)
     df.columns = df.columns.str.strip()
 
-    # Detect subject ID column
-    id_col = None
-    for candidate in ["subject_id", "subject", "id", "patient_id", "file", "eeg_file"]:
-        if candidate in df.columns.str.lower().tolist():
-            id_col = df.columns[df.columns.str.lower() == candidate][0]
-            break
-    if id_col is None:
-        # Fall back to first column
-        id_col = df.columns[0]
+    col_lower = {c.lower().strip(): c for c in df.columns}
 
-    # Detect HIE grade column
-    grade_col = None
-    for candidate in ["hie_grade", "grade", "hie", "outcome", "severity"]:
-        if candidate in df.columns.str.lower().tolist():
-            grade_col = df.columns[df.columns.str.lower() == candidate][0]
-            break
-    if grade_col is None:
-        raise ValueError(
-            f"Cannot find HIE grade column. Available columns: {df.columns.tolist()}"
-        )
+    # Subject numeric ID column
+    id_col = col_lower.get("id", df.columns[0])
+
+    # EEG filename column — 'EEG file' in Helsinki dataset
+    eeg_file_col = (
+        col_lower.get("eeg file") or
+        col_lower.get("eeg_file") or
+        None
+    )
+
+    # Diagnosis/grade column
+    diag_col = (
+        col_lower.get("diagnosis") or
+        col_lower.get("hie_grade") or
+        col_lower.get("grade") or
+        col_lower.get("outcome") or
+        col_lower.get("severity") or
+        None
+    )
 
     rng = np.random.default_rng(seed=42)
     records = []
+
     for _, row in df.iterrows():
-        try:
-            grade_raw = str(row[grade_col]).strip().lower()
-            if grade_raw in ("nan", "none", ""):
-                grade = None
-            elif grade_raw in ("0", "normal", "no hie"):
-                grade = 0
-            elif grade_raw in ("1", "mild"):
-                grade = 1
-            elif grade_raw in ("2", "moderate"):
-                grade = 2
-            elif grade_raw in ("3", "severe"):
-                grade = 3
-            else:
-                # Try numeric conversion
-                try:
-                    grade = int(float(grade_raw))
-                except ValueError:
-                    grade = None
-        except Exception:
-            grade = None
+        subj_id = str(row[id_col]).strip()
+
+        eeg_file = ""
+        if eeg_file_col:
+            eeg_file = str(row[eeg_file_col]).strip().lower()
+
+        diag_text = str(row[diag_col]) if diag_col else ""
+        grade = _parse_hie_grade_from_text(diag_text)
 
         label, dq = hie_grade_to_label_dq(grade, has_seizures=False, rng=rng)
         records.append({
-            "subject_id": str(row[id_col]).strip(),
-            "hie_grade": grade,
-            "label": label,
-            "dq": dq,
+            "subject_id": subj_id,
+            "eeg_file":   eeg_file,   # e.g. 'eeg10' → matches eeg10.edf
+            "hie_grade":  grade,
+            "label":      label,
+            "dq":         dq,
         })
 
     return pd.DataFrame(records)
@@ -113,37 +138,45 @@ def add_seizure_labels(
 ) -> pd.DataFrame:
     """
     Merge seizure annotation info into clinical DataFrame.
-    Subjects with any annotated seizure have label forced to 1 and DQ shifted −10.
+    Subjects with ≥1 reviewer annotating a seizure → label forced to 1, DQ −10.
 
-    annotations_csv_path: path to annotations_2017_A.csv
-    df must have column 'subject_id'.
+    Helsinki annotations_2017_A.csv format:
+      WIDE binary matrix — COLUMNS = subject IDs (as strings '1'..'79'),
+      ROWS = reviewer annotations (1.0 = seizure annotated by that reviewer).
+      A subject has confirmed seizures if its column sum > 0.
+
+    df must have column 'subject_id' (numeric string, e.g. '10').
     """
     if rng is None:
         rng = np.random.default_rng(seed=42)
 
-    ann = pd.read_csv(annotations_csv_path)
-    ann.columns = ann.columns.str.strip()
+    try:
+        ann = pd.read_csv(annotations_csv_path)
+    except Exception:
+        return df  # annotations unreadable — skip silently
 
-    # Detect subject column in annotations
-    subj_col = None
-    for candidate in ["subject", "subject_id", "id", "patient", "file"]:
-        if candidate in ann.columns.str.lower().tolist():
-            subj_col = ann.columns[ann.columns.str.lower() == candidate][0]
-            break
-    if subj_col is None:
-        subj_col = ann.columns[0]
+    # Build set of subject IDs whose column sums > 0
+    subjects_with_seizures: set = set()
+    for col in ann.columns:
+        try:
+            # Column header is the subject ID integer as a string
+            sid = str(int(float(str(col).strip())))
+            col_sum = pd.to_numeric(ann[col], errors="coerce").sum()
+            if col_sum > 0:
+                subjects_with_seizures.add(sid)
+        except (ValueError, TypeError):
+            pass
 
-    subjects_with_seizures = set(ann[subj_col].astype(str).str.strip().unique())
-
-    def _update_row(row):
-        has_sz = str(row["subject_id"]) in subjects_with_seizures
-        if has_sz:
-            row = row.copy()
+    result_rows = []
+    for _, row in df.iterrows():
+        row = row.copy()
+        sid = str(row["subject_id"]).strip()
+        if sid in subjects_with_seizures:
             row["label"] = 1
-            row["dq"] = max(0.0, float(row["dq"]) - 10.0)
-        return row
+            row["dq"]    = max(0.0, float(row["dq"]) - 10.0)
+        result_rows.append(row)
 
-    return df.apply(_update_row, axis=1)
+    return pd.DataFrame(result_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -153,49 +186,41 @@ def add_seizure_labels(
 def parse_mri_participants_tsv(participants_tsv_path: str) -> pd.DataFrame:
     """
     Parse participants.tsv from BIDS dataset.
-    Returns DataFrame with columns: participant_id, age_months, label, dq.
+    Returns DataFrame: participant_id, age_months, label, dq.
 
     Baby Open Brains = healthy controls → all label 0.
-    Age in tsv may be in years (float) — convert to months.
+    Age in tsv may be in years (float < 10) — converted to months.
     """
     df = pd.read_csv(participants_tsv_path, sep="\t")
     df.columns = df.columns.str.strip()
+    col_lower = {c.lower().strip(): c for c in df.columns}
 
-    # Detect age column
-    age_col = None
-    for candidate in ["age", "age_months", "age_years", "scan_age"]:
-        if candidate in df.columns.str.lower().tolist():
-            age_col = df.columns[df.columns.str.lower() == candidate][0]
-            break
+    age_col = (
+        col_lower.get("age") or
+        col_lower.get("age_months") or
+        col_lower.get("age_years") or
+        col_lower.get("scan_age") or
+        None
+    )
 
     rng = np.random.default_rng(seed=42)
     records = []
     for _, row in df.iterrows():
         pid = str(row.get("participant_id", row.iloc[0])).strip()
 
-        # Parse age
+        age_months = 6.0  # default
         if age_col is not None:
             try:
                 age_raw = float(row[age_col])
-                # Heuristic: if age < 10, assume years; else assume months
-                if age_raw < 10:
-                    age_months = age_raw * 12.0
-                else:
-                    age_months = age_raw
+                age_months = age_raw * 12.0 if age_raw < 10 else age_raw
             except (ValueError, TypeError):
-                age_months = 6.0  # default: infant
-        else:
-            age_months = 6.0  # default
-
-        # All subjects in Baby Open Brains are healthy controls
-        label = 0
-        dq = float(rng.uniform(80, 100))
+                pass
 
         records.append({
             "participant_id": pid,
-            "age_months": age_months,
-            "label": label,
-            "dq": dq,
+            "age_months":     age_months,
+            "label":          0,
+            "dq":             float(rng.uniform(80, 100)),
         })
 
     return pd.DataFrame(records)
@@ -214,7 +239,6 @@ ID_KEYWORDS = [
     "charge", "rubinstein-taybi", "sotos", "weaver", "bohring-opitz",
 ]
 
-# DQ sampling ranges per known disease pattern
 _DISEASE_DQ_MAP = {
     "down syndrome":             (45, 65),
     "trisomy 21":                (45, 65),
@@ -231,10 +255,7 @@ _DISEASE_DQ_MAP = {
 def hpo_disease_to_label(disease_name: str) -> int:
     """Return 1 if disease is ID-relevant, 0 otherwise."""
     name_lower = disease_name.lower()
-    for kw in ID_KEYWORDS:
-        if kw in name_lower:
-            return 1
-    return 0
+    return int(any(kw in name_lower for kw in ID_KEYWORDS))
 
 
 def hpo_disease_to_dq(
@@ -242,20 +263,13 @@ def hpo_disease_to_dq(
     label: int,
     rng: Optional[np.random.Generator] = None,
 ) -> float:
-    """
-    Sample DQ for an HPO disease based on disease name patterns.
-    Only meaningful for label=1 diseases.
-    """
+    """Sample DQ for an HPO disease based on name patterns."""
     if rng is None:
         rng = np.random.default_rng()
-
     if label == 0:
         return float(rng.uniform(85, 100))
-
     name_lower = disease_name.lower()
     for keyword, (lo, hi) in _DISEASE_DQ_MAP.items():
         if keyword in name_lower:
             return float(rng.uniform(lo, hi))
-
-    # Default ID range
     return float(rng.uniform(35, 65))
