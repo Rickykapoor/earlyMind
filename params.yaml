@@ -1,0 +1,52 @@
+model:
+  embed_dim: 128
+  fusion_heads: 4
+  fusion_layers: 3
+  dropout: 0.2
+  eeg_channels: 19
+  eeg_timesteps: 7680
+  mri_img_size: 64
+  mri_slices: 3
+  hpo_n_features: 1024  # updated after preprocessing
+
+training:
+  batch_size: 16
+  epochs: 100
+  lr: 0.0003
+  weight_decay: 0.0001
+  patience: 15
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  severity_loss_weight: 0.5
+  grad_clip: 1.0
+  freeze_encoders_epochs: 10
+  seed: 42
+
+data:
+  eeg_sample_rate: 256
+  eeg_epoch_seconds: 30
+  eeg_epoch_overlap: 0.5
+  eeg_bandpass_low: 0.5
+  eeg_bandpass_high: 40.0
+  eeg_notch_freq: 50.0
+  mri_slice_size: 64
+  hpo_min_disease_freq: 5
+  train_val_test_split: [0.70, 0.15, 0.15]
+
+paths:
+  eeg_raw: datasets/eeg/helsinki_neonatal
+  mri_raw: datasets/mri/baby_open_brains
+  hpo_raw: datasets/facial/hpo
+  eeg_processed: datasets/processed/eeg
+  mri_processed: datasets/processed/mri
+  hpo_processed: datasets/processed/facial
+  checkpoints: checkpoints
+  reports: reports
+
+severity:
+  typical: [85, 100]
+  borderline: [70, 85]
+  mild: [55, 70]
+  moderate: [35, 55]
+  severe: [20, 35]
+  profound: [0, 20]

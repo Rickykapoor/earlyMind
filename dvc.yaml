@@ -1,0 +1,191 @@
+stages:
+  eeg_preprocess:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      from src.data.eeg_loader import process_eeg_dataset;
+      from src.config import cfg;
+      process_eeg_dataset(cfg.paths.eeg_raw, cfg.paths.eeg_processed)"
+    deps:
+      - datasets/eeg/helsinki_neonatal
+      - src/data/eeg_loader.py
+      - src/config.py
+    outs:
+      - datasets/processed/eeg
+    params:
+      - params.yaml:
+          - data.eeg_sample_rate
+          - data.eeg_epoch_seconds
+          - data.eeg_epoch_overlap
+
+  mri_preprocess:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      from src.data.mri_loader import process_mri_dataset;
+      from src.config import cfg;
+      process_mri_dataset(cfg.paths.mri_raw, cfg.paths.mri_processed)"
+    deps:
+      - datasets/mri/baby_open_brains
+      - src/data/mri_loader.py
+      - src/config.py
+    outs:
+      - datasets/processed/mri
+    params:
+      - params.yaml:
+          - data.mri_slice_size
+
+  hpo_preprocess:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      from src.data.hpo_loader import process_hpo_dataset;
+      from src.config import cfg;
+      process_hpo_dataset(cfg.paths.hpo_raw, cfg.paths.hpo_processed)"
+    deps:
+      - datasets/facial/hpo
+      - src/data/hpo_loader.py
+      - src/config.py
+    outs:
+      - datasets/processed/facial
+    params:
+      - params.yaml:
+          - data.hpo_min_disease_freq
+
+  train_eeg_encoder:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      import torch, numpy as np
+      from src.config import cfg
+      from src.models.eeg_encoder import EEGEncoder, EEGSeizureDataset
+      from src.training.trainer import pretrain_encoder
+      import torch.nn as nn
+      from torch.utils.data import DataLoader
+      import pandas as pd
+      device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+      cfg.paths.makedirs()
+      eeg_proc = cfg.paths.eeg_processed
+      epoch_files = sorted(eeg_proc.glob('*_epochs.npy'))
+      label_df = pd.read_csv(eeg_proc / 'labels.csv') if (eeg_proc / 'labels.csv').exists() else None
+      records = []
+      for ep in epoch_files:
+          sid = ep.stem.replace('_epochs', '')
+          lbl, dq = 0, 90.0
+          if label_df is not None:
+              row = label_df[label_df['subject_id'].astype(str) == sid]
+              if len(row) > 0:
+                  lbl = int(row.iloc[0]['label'])
+          records.append({'subject_id': sid, 'epoch_path': str(ep), 'label': lbl, 'dq': dq})
+      enc = EEGEncoder(embed_dim=128)
+      if len(records) > 1:
+          train_recs = records[:-1]; val_recs = [records[-1]]
+      else:
+          train_recs = val_recs = records
+      train_ds = EEGSeizureDataset(train_recs, augment=True)
+      val_ds   = EEGSeizureDataset(val_recs,   augment=False)
+      pretrain_encoder(enc, DataLoader(train_ds, batch_size=4, shuffle=True),
+          DataLoader(val_ds, batch_size=4), 50, 1e-3, device,
+          str(cfg.paths.checkpoints / 'eeg_encoder_pretrained.pt'),
+          nn.BCEWithLogitsLoss(),
+          lambda m, x: m(x.to(device), pretrain=True)['seizure_logit'],
+          'EEG', 10)"
+    deps:
+      - datasets/processed/eeg
+      - src/models/eeg_encoder.py
+      - src/training/trainer.py
+    outs:
+      - checkpoints/eeg_encoder_pretrained.pt
+    params:
+      - params.yaml:
+          - model.embed_dim
+          - training.seed
+
+  train_mri_encoder:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      import torch
+      from src.config import cfg
+      from src.models.mri_encoder import MRIEncoder, MRIPretrainDataset
+      from src.training.trainer import pretrain_encoder
+      import torch.nn as nn
+      from torch.utils.data import DataLoader
+      from sklearn.model_selection import train_test_split
+      device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+      cfg.paths.makedirs()
+      mri_files = sorted(cfg.paths.mri_processed.glob('sub-*.npy'))
+      records = [{'out_path': str(f), 'label': 0} for f in mri_files]
+      train_r, val_r = train_test_split(records, test_size=0.2, random_state=42)
+      enc = MRIEncoder(embed_dim=128)
+      pretrain_encoder(enc,
+          DataLoader(MRIPretrainDataset(train_r, augment=True),  batch_size=4, shuffle=True),
+          DataLoader(MRIPretrainDataset(val_r,   augment=False), batch_size=4),
+          30, 5e-4, device,
+          str(cfg.paths.checkpoints / 'mri_encoder_pretrained.pt'),
+          nn.BCEWithLogitsLoss(),
+          lambda m, x: m(x.to(device), pretrain=True)['myelin_logit'],
+          'MRI', 8)"
+    deps:
+      - datasets/processed/mri
+      - src/models/mri_encoder.py
+      - src/training/trainer.py
+    outs:
+      - checkpoints/mri_encoder_pretrained.pt
+
+  train_hpo_encoder:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      import torch, numpy as np
+      from src.config import cfg
+      from src.models.hpo_encoder import HPOEncoder, HPOPretrainDataset
+      from src.training.trainer import pretrain_encoder
+      import torch.nn as nn
+      from torch.utils.data import DataLoader
+      from sklearn.model_selection import train_test_split
+      device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+      cfg.paths.makedirs()
+      X = np.load(str(cfg.paths.hpo_processed / 'hpo_matrix.npy'))
+      y = np.load(str(cfg.paths.hpo_processed / 'hpo_labels.npy'))
+      X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.3, stratify=y, random_state=42)
+      pos_frac = y_tr.mean()
+      pos_w = torch.tensor([(1-pos_frac)/(pos_frac+1e-8)], dtype=torch.float32)
+      enc = HPOEncoder(n_hpo=X.shape[1], embed_dim=128)
+      pretrain_encoder(enc,
+          DataLoader(HPOPretrainDataset(X_tr, y_tr), batch_size=32, shuffle=True),
+          DataLoader(HPOPretrainDataset(X_te, y_te), batch_size=32),
+          100, 1e-3, device,
+          str(cfg.paths.checkpoints / 'hpo_encoder_pretrained.pt'),
+          nn.BCEWithLogitsLoss(pos_weight=pos_w.to(device)),
+          lambda m, x: m(x.to(device), pretrain=True)['id_logit'],
+          'HPO', 15)"
+    deps:
+      - datasets/processed/facial
+      - src/models/hpo_encoder.py
+      - src/training/trainer.py
+    outs:
+      - checkpoints/hpo_encoder_pretrained.pt
+
+  train_fusion:
+    cmd: /opt/anaconda3/envs/infant_id/bin/python -c "
+      import torch
+      from src.config import cfg
+      from src.models.fusion_model import build_fusion_model
+      from src.data.fusion_dataset import build_dataloaders
+      from src.training.trainer import train_fusion_model
+      device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+      cfg.paths.makedirs()
+      tr, vl, te = build_dataloaders(
+          eeg_processed_dir=cfg.paths.eeg_processed,
+          mri_processed_dir=cfg.paths.mri_processed,
+          hpo_processed_dir=cfg.paths.hpo_processed,
+          eeg_raw_dir=cfg.paths.eeg_raw,
+          batch_size=cfg.training.batch_size)
+      model = build_fusion_model(
+          n_hpo=cfg.model.hpo_n_features, freeze_encoders=True,
+          eeg_ckpt=str(cfg.paths.checkpoints/'eeg_encoder_pretrained.pt'),
+          mri_ckpt=str(cfg.paths.checkpoints/'mri_encoder_pretrained.pt'),
+          hpo_ckpt=str(cfg.paths.checkpoints/'hpo_encoder_pretrained.pt'))
+      train_fusion_model(model, tr, vl, device, str(cfg.paths.checkpoints))"
+    deps:
+      - checkpoints/eeg_encoder_pretrained.pt
+      - checkpoints/mri_encoder_pretrained.pt
+      - checkpoints/hpo_encoder_pretrained.pt
+      - src/models/fusion_model.py
+      - src/training/trainer.py
+    outs:
+      - checkpoints/fusion_model.pt
+    params:
+      - params.yaml:
+          - training.epochs
+          - training.lr
+          - training.patience
