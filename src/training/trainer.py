@@ -106,7 +106,11 @@ def pretrain_encoder(
             optimizer.zero_grad()
             inputs, labels = _unpack_batch(batch, device)
             logits = get_logits_fn(encoder, inputs)
-            loss   = loss_fn(logits, labels)
+            
+            if logits.shape != labels.shape:
+                labels = labels.view_as(logits)
+            loss   = loss_fn(logits, labels.float())
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
             optimizer.step()
@@ -121,7 +125,11 @@ def pretrain_encoder(
             for batch in val_loader:
                 inputs, labels = _unpack_batch(batch, device)
                 logits = get_logits_fn(encoder, inputs)
-                loss   = loss_fn(logits, labels)
+                
+                if logits.shape != labels.shape:
+                    labels = labels.view_as(logits)
+                loss   = loss_fn(logits, labels.float())
+                
                 val_losses.append(loss.item())
 
         train_loss = np.mean(train_losses)
