@@ -163,7 +163,12 @@ class MultimodalDataset(Dataset):
         if "features" in rec and rec["features"] is not None:
             feats = rec["features"].astype(np.float32)
         else:
-            n = cfg.model.hpo_n_features
+            # Dynamically infer feature size if possible
+            n = 1024
+            if hasattr(self, "hpo_records") and len(self.hpo_records) > 0:
+                n = len(self.hpo_records[0].get("features", np.zeros(1024)))
+            else:
+                n = cfg.model.hpo_n_features
             return torch.zeros(n)
         return torch.from_numpy(feats)
 
@@ -323,7 +328,8 @@ def collate_multimodal(batch: List[dict]) -> dict:
         result["mri"] = torch.stack(mri_tensors)
 
     if "hpo" in keys_present:
-        n_hpo = cfg.model.hpo_n_features
+        # Dynamically find the feature size from the first non-missing HPO tensor
+        n_hpo = next((item["hpo"].shape[0] for item in batch if "hpo" in item), cfg.model.hpo_n_features)
         hpo_tensors = [
             item.get("hpo", torch.zeros(n_hpo)) for item in batch
         ]
