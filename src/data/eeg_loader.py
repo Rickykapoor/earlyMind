@@ -258,9 +258,9 @@ def process_eeg_dataset(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    edf_files = sorted(eeg_dir.glob("*.edf"))
+    edf_files = sorted([f for f in eeg_dir.glob("*.edf") if not f.name.startswith("._")])
     if len(edf_files) == 0:
-        raise FileNotFoundError(f"No .edf files found in {eeg_dir}")
+        raise FileNotFoundError(f"No valid .edf files found in {eeg_dir}")
 
     print(f"Found {len(edf_files)} EDF files: {[f.name for f in edf_files]}")
 
