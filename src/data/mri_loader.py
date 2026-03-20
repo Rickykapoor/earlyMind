@@ -122,7 +122,7 @@ def find_structural_scan(
             f"**/*_{modality}.nii",
         ]
         for pat in patterns:
-            hits = sorted(subject_dir.glob(pat))
+            hits = sorted([p for p in subject_dir.glob(pat) if not p.name.startswith("._")])
             if hits:
                 return hits[0]
         return None
