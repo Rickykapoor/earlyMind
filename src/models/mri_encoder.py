@@ -152,8 +152,9 @@ class MRIPretrainDataset(torch.utils.data.Dataset):
         self._items = []
 
         for rec in subject_records:
-            slices = np.load(rec["out_path"], allow_pickle=False).astype("float32")
-            label  = int(rec.get("label", 0))
+            data   = np.load(rec["out_path"], allow_pickle=True)
+            slices = data["slices"].astype("float32")   # .npz key
+            label  = int(data.get("label", rec.get("label", 0)))
             self._items.append((slices, label))
 
             # Add synthetic delayed-myelination sample for label=0 subjects
@@ -169,8 +170,11 @@ class MRIPretrainDataset(torch.utils.data.Dataset):
         import numpy as np
         slices, label = self._items[idx]
         if self.augment:
-            from src.data.mri_loader import augment_mri_slices
-            slices = augment_mri_slices(slices, rng=self.rng)
+            from src.data.mri_loader import simulate_delayed_myelination
+            # Light random augmentation: small probability of applying delay sim
+            if self.rng.random() < 0.5:
+                severity = self.rng.uniform(0.1, 0.4)
+                slices = simulate_delayed_myelination(slices, severity=severity, rng=self.rng)
 
         # Shape: (3, 64, 64) → (3, 1, 64, 64)
         slices = slices[:, np.newaxis, :, :]
