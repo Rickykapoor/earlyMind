@@ -62,15 +62,15 @@ class LateFusionTransformer(nn.Module):
         # Optionally load pretrained checkpoints
         if eeg_ckpt is not None:
             self.eeg_encoder.load_state_dict(
-                torch.load(eeg_ckpt, map_location="cpu"), strict=False
+                torch.load(eeg_ckpt, map_location="cpu", weights_only=False), strict=False
             )
         if mri_ckpt is not None:
             self.mri_encoder.load_state_dict(
-                torch.load(mri_ckpt, map_location="cpu"), strict=False
+                torch.load(mri_ckpt, map_location="cpu", weights_only=False), strict=False
             )
         if hpo_ckpt is not None:
             self.hpo_encoder.load_state_dict(
-                torch.load(hpo_ckpt, map_location="cpu"), strict=False
+                torch.load(hpo_ckpt, map_location="cpu", weights_only=False), strict=False
             )
 
         if freeze_encoders:
