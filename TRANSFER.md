@@ -188,6 +188,64 @@ Set these in Windows System Properties → Environment Variables if you want to 
 
 ---
 
+## Post-Transfer Retraining Roadmap
+
+> [!IMPORTANT]
+> The checkpoints bundled in GitHub Releases (`v1.0.0-data`) were trained on the
+> **pre-augmentation** dataset (Mar 21). The augmented MRI data (10,000 samples, Apr 12)
+> is **not** in those checkpoints yet. Use this roadmap to retrain after transfer.
+
+### What's Already There After Transfer
+
+| Asset | Status |
+|-------|--------|
+| Raw datasets (EEG, MRI, HPO) | ✅ Downloaded by `setup.bat` from GitHub Releases |
+| Stale checkpoints (Mar 21) | ✅ Downloaded — work for inference immediately |
+| Augmented MRI data | ❌ Must be **regenerated** (deterministic, seed=42) |
+
+### Retraining Steps — On Windows (local GPU)
+
+Open **Anaconda Prompt**, `cd` to the project folder, then:
+
+```batch
+call conda activate infant_id
+
+REM Step 1: Regenerate augmented MRI dataset (deterministic, seed=42 — same result as Mac)
+python scripts/balance_mri.py --skip-preprocess
+
+REM Step 2: Retrain all 3 encoders on augmented data
+python src/scripts/run_eeg_encoder.py
+python src/scripts/run_mri_encoder.py
+python src/scripts/run_hpo_encoder.py
+
+REM Step 3: Retrain fusion model with new encoder checkpoints
+python src/scripts/run_fusion.py
+```
+
+> Estimated time on a mid-range GPU (RTX 3060+): ~2-4 hours for full pipeline.
+
+### Retraining Steps — On Google Colab (alternative)
+
+Run notebooks in order — they auto-regenerate augmented data and retrain:
+
+```
+notebooks/02_mri_preprocess.ipynb   ← re-runs augmentation (Cell 7)
+notebooks/04_train_encoders.ipynb   ← retrains EEG/MRI/HPO encoders on augmented data
+notebooks/05_fusion_train.ipynb     ← retrains fusion model
+notebooks/06_evaluate.ipynb         ← evaluates new model
+```
+
+After training completes, the fresh `.pt` files will be committed via the last cell:
+```python
+!git add checkpoints/ reports/
+!git commit -m "retrain: fusion model on augmented MRI dataset"
+!git push origin main
+```
+
+Then pull on Windows: `git pull origin main` — your local checkpoints are updated.
+
+---
+
 ## Docker (Alternative)
 
 If Docker Desktop is installed on Windows, you can skip the conda setup entirely:
