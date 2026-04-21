@@ -33,6 +33,22 @@ stages:
       - params.yaml:
           - data.mri_slice_size
 
+  mri_augment:
+    cmd: python scripts/balance_mri.py --skip-preprocess
+    deps:
+      - datasets/processed/mri
+      - src/data/mri_augment.py
+      - src/data/mri_loader.py
+      - scripts/balance_mri.py
+      - src/config.py
+    outs:
+      - datasets/mri/augmented
+    params:
+      - params.yaml:
+          - augmentation.mri_target_samples
+          - augmentation.mri_aug_seed
+          - augmentation.mri_dq_noise_std
+
   hpo_preprocess:
     cmd: >-
       python -c "

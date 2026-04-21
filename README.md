@@ -1,163 +1,110 @@
 # EarlyMind 🧠
-### Multimodal Late-Fusion Deep Learning for Infant Intellectual Disability Risk Detection
+### Multimodal Infant ID Risk Detection — Deployed
 
+![License](https://img.shields.io/badge/license-MIT-blue)
 ![Python](https://img.shields.io/badge/Python-3.10-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
-![Platform](https://img.shields.io/badge/Platform-Apple%20Silicon%20%7C%20CUDA-green)
-
-EarlyMind is a production-ready multimodal deep learning system for early detection of Intellectual Disability (ID) risk in infants aged 0–36 months. It fuses EEG neurophysiology, structural brain MRI, and Human Phenotype Ontology (HPO) genetic/dysmorphic features using a late-fusion Transformer architecture.
 
 ---
 
-## 🧬 Modalities
+## About this Space
 
-| Modality | Dataset | Subjects | Description |
-|----------|---------|----------|-------------|
-| **EEG** | Helsinki Neonatal EEG | 3 | 19-channel neonatal EEG, HIE grading |
-| **MRI** | Baby Open Brains (ds004797) | 10 | T1w/T2w structural MRI, BIDS format |
-| **HPO** | Human Phenotype Ontology | ~400 diseases | Frequency-weighted phenotype feature matrix |
+EarlyMind is a production-ready multimodal deep learning system for **early detection of Intellectual Disability (ID) risk** in infants aged 0–36 months. It fuses three data modalities:
 
----
+| Modality | Data | Encoder |
+|----------|------|---------|
+| **EEG** | 19-channel neonatal EEG | Multi-scale CNN + Transformer |
+| **MRI** | T1w/T2w brain MRI (3 slices) | EfficientNet-B0 + cross-slice attention |
+| **HPO** | Human Phenotype Ontology (5,284 terms) | Self-attention MLP |
+| | | LateFusionTransformer → ID Risk + DQ |
 
-## 🏗️ Architecture
-
-```
-EEG (19×7680)    → EEGEncoder (CNN-Transformer)  → (B, 128)
-MRI (3×1×64×64)  → MRIEncoder (EfficientNet-B0)  → (B, 128)
-HPO (n_hpo,)     → HPOEncoder (Attention-MLP)    → (B, 128)
-                        ↓
-              LateFusionTransformer
-           [CLS | EEG | MRI | HPO] → Transformer(3L, 4H)
-                        ↓
-            ┌─────────┬─────────────┐
-            │ Classify │ DQ Severity │
-            │ (B, 2)  │  (B, 1)    │
-            └─────────┴─────────────┘
-```
-
-**Severity metric**: Developmental Quotient (DQ) = (Dev. Age / Chron. Age) × 100  
-Valid 0–36 months (Bayley-4, ASQ-3, Vineland-3, DAYC-2)
+**API base URL**: `http://localhost:8000` (FastAPI)  
+**UI URL**: `http://localhost:8501` (Streamlit)
 
 ---
 
-## ⚡ Quick Start
+## Quick Start
 
-### Prerequisites
+### Local Development (Docker)
+
 ```bash
+docker compose up --build
+```
+
+Then open:
+- **Streamlit UI**: http://localhost:8501
+- **API docs**: http://localhost:8000/docs
+
+### Local Development (Python)
+
+```bash
+conda env create -f environment.yml
 conda activate infant_id
-# Python: /opt/anaconda3/envs/infant_id/bin/python
+bash startup.sh
 ```
 
-### Step 1 — Local setup
+### HuggingFace Spaces
+
+This Space is deployed via Docker. To deploy your own:
+
+1. Fork this repository
+2. Create a new Space at https://huggingface.co/new-space
+3. Select **Docker** as the SDK
+4. Set the Docker image to your GitHub Container Registry URL (e.g. `ghcr.io/username/earlymind:latest`)
+5. The Space will auto-deploy from your Dockerfile
+
+---
+
+## API Reference
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check + model status |
+| `GET` | `/model/info` | Model metadata + DQ severity bands |
+| `POST` | `/predict` | Full multimodal prediction |
+| `POST` | `/predict/eeg` | EEG-only prediction |
+| `POST` | `/predict/mri` | MRI-only prediction |
+| `POST` | `/predict/hpo` | HPO-only prediction |
+| `POST` | `/predict/batch` | Batch prediction (up to 32) |
+| `POST` | `/preprocess/edf` | Upload EDF → extract features |
+| `POST` | `/preprocess/nifti` | Upload NIfTI → extract slices |
+
+### Example Request
+
 ```bash
-bash setup.sh
-dvc pull    # download datasets from Google Drive
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hpo": [0.0, 0.1, 0.5, 0.0],
+    "hpo_symptom_score": 0.3
+  }'
 ```
 
-### Step 2 — Preprocess (Google Colab, CPU runtime)
-```
-Upload and run: notebooks/01_eeg_preprocess.ipynb
-Upload and run: notebooks/02_mri_preprocess.ipynb
-Upload and run: notebooks/03_hpo_preprocess.ipynb
+### Example Response
+
+```json
+{
+  "risk_probability": 0.42,
+  "dq_estimate": 65.0,
+  "dq_label": "Mild ID Risk",
+  "confidence": "Moderate",
+  "modality_importance": [0.1, 0.1, 0.8],
+  "warnings": ["HPO encoder undertrained; result blended with clinical score."]
+}
 ```
 
-### Step 3 — Train encoders (Colab, T4 GPU)
-```
-Upload and run: notebooks/04_train_encoders.ipynb
-```
+### Upload EDF for preprocessing
 
-### Step 4 — Train fusion model (Colab, T4 GPU, ~2–3 hours)
-```
-Upload and run: notebooks/05_fusion_train.ipynb
-```
-
-### Step 5 — Evaluate (Colab)
-```
-Upload and run: notebooks/06_evaluate.ipynb
-```
-
-### Step 6 — Local deployment
 ```bash
-git pull origin main
-dvc pull
-/opt/anaconda3/envs/infant_id/bin/streamlit run app.py
+curl -X POST http://localhost:8000/preprocess/edf \
+  -F "file=@path/to/recording.edf"
 ```
 
 ---
 
-## 🖥️ Streamlit UI
-
-Run: `/opt/anaconda3/envs/infant_id/bin/streamlit run app.py`
-
-The app has three pages:
-
-| Page | Description |
-|------|-------------|
-| 📊 Data Overview | EEG waveforms, MRI slices, HPO stats |
-| 📈 Training Monitor | Loss/AUC curves, benchmark report |
-| 🔍 Predict Infant | Manual input or JSON file upload with clinical results |
-
----
-
-## 📁 Project Structure
-
-```
-Id predictor/
-├── params.yaml              ← All hyperparameters
-├── dvc.yaml                 ← DVC pipeline stages
-├── requirements.txt
-├── environment.yml
-├── setup.sh                 ← One-shot setup
-├── app.py                   ← Streamlit UI
-│
-├── src/
-│   ├── config.py            ← Typed Config dataclass
-│   ├── data/
-│   │   ├── eeg_loader.py    ← MNE preprocessing + feature extraction
-│   │   ├── mri_loader.py    ← NIfTI slice extraction
-│   │   ├── hpo_loader.py    ← HPO pivot matrix builder
-│   │   └── fusion_dataset.py← Multi-modal PyTorch Dataset
-│   ├── models/
-│   │   ├── eeg_encoder.py   ← Multi-scale CNN + Transformer
-│   │   ├── mri_encoder.py   ← EfficientNet-B0 + cross-slice attention
-│   │   ├── hpo_encoder.py   ← Self-attention MLP
-│   │   └── fusion_model.py  ← LateFusionTransformer
-│   ├── training/
-│   │   ├── losses.py        ← FocalLoss + CombinedLoss
-│   │   ├── trainer.py       ← Training loops + early stopping
-│   │   └── evaluate.py      ← Metrics, ablation, benchmark report
-│   └── utils/
-│       ├── age_norms.py     ← DQ computation + age bands
-│       └── label_utils.py   ← Dataset-specific label converters
-│
-├── notebooks/               ← 6 Colab-ready notebooks
-├── datasets/
-│   ├── eeg/helsinki_neonatal/
-│   ├── mri/baby_open_brains/
-│   ├── facial/hpo/
-│   └── processed/           ← Generated by preprocessing
-├── checkpoints/             ← Saved model weights
-└── reports/                 ← Benchmark report + training history
-```
-
----
-
-## 📊 Target Performance
-
-| Metric | Target |
-|--------|--------|
-| AUC | ≥ 0.85 |
-| Sensitivity | ≥ 0.80 |
-| Specificity | ≥ 0.70 |
-| F1 Score | ≥ 0.75 |
-| DQ MAE | ≤ 12 points |
-
-Classification threshold is optimized on the validation set to maximize  
-`F1 × (2×Sensitivity + Specificity) / 3` — prioritizing sensitivity for clinical safety.
-
----
-
-## 🔬 DQ Severity Scale
+## DQ Severity Scale
 
 | DQ Range | Label |
 |----------|-------|
@@ -168,20 +115,22 @@ Classification threshold is optimized on the validation set to maximize
 | 20–34 | Severe ID risk |
 | 0–19 | Profound ID risk |
 
-**DQ = (Developmental Age / Chronological Age) × 100** — valid for 0–36 months only.
-
 ---
 
 ## ⚕️ Clinical Disclaimer
 
-EarlyMind is a **research screening tool only**. It is not FDA cleared and does not provide a clinical diagnosis. All results must be interpreted by qualified healthcare professionals using validated instruments (Bayley-4, Vineland-3, ASQ-3).
+EarlyMind is a **research screening tool only**. It is not FDA cleared and does not provide clinical diagnosis. All results must be interpreted by qualified healthcare professionals.
 
 ---
 
-## 🔗 Resources
+## Environment Variables
 
-- [Helsinki Neonatal EEG Dataset](https://physionet.org/content/neonatal-eeg-seizure-detection/)
-- [Baby Open Brains (ds004797)](https://openneuro.org/datasets/ds004797)
-- [Human Phenotype Ontology](https://hpo.jax.org/)
-- [DVC Documentation](https://dvc.org/doc)
-- [Bayley-4 Assessment](https://www.pearsonassessments.com/store/usassessments/en/Store/Professional-Assessments/Cognition-%26-Neuro/Bayley-Scales-of-Infant-and-Toddler-Development-%7C-Fourth-Edition/p/100001996.html)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EARLYMIND_CKPT_DIR` | `checkpoints` | Path to model checkpoints |
+| `EARLYMIND_DEVICE` | `cpu` | Device for inference |
+| `EARLYMIND_LOG_LEVEL` | `INFO` | Logging level |
+| `UVICORN_PORT` | `8000` | FastAPI port |
+| `STREAMLIT_PORT` | `8501` | Streamlit port |
+| `EARLYMIND_MAX_EEG_MB` | `50` | Max EDF upload size (MB) |
+| `EARLYMIND_MAX_MRI_MB` | `200` | Max NIfTI upload size (MB) |

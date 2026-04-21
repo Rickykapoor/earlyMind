@@ -1,0 +1,6 @@
+torch
+torchvision
+torchaudio
+numpy
+pandas
+gradio>=4.0.0

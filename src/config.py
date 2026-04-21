@@ -43,6 +43,14 @@ class ModelConfig:
 
 
 @dataclass
+class AugmentationConfig:
+    mri_target_samples: int   = 10_000
+    mri_aug_seed:       int   = 42
+    mri_dq_noise_std:   float = 5.0
+    use_augmented_mri:  bool  = True
+
+
+@dataclass
 class TrainingConfig:
     batch_size: int = 16
     epochs: int = 100
@@ -107,11 +115,12 @@ class SeverityConfig:
 
 @dataclass
 class Config:
-    model: ModelConfig = field(default_factory=ModelConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)
-    data: DataConfig = field(default_factory=DataConfig)
-    paths: PathsConfig = field(default_factory=PathsConfig)
-    severity: SeverityConfig = field(default_factory=SeverityConfig)
+    model:         ModelConfig       = field(default_factory=ModelConfig)
+    training:      TrainingConfig    = field(default_factory=TrainingConfig)
+    data:          DataConfig        = field(default_factory=DataConfig)
+    paths:         PathsConfig       = field(default_factory=PathsConfig)
+    severity:      SeverityConfig    = field(default_factory=SeverityConfig)
+    augmentation:  AugmentationConfig = field(default_factory=AugmentationConfig)
 
     @classmethod
     def from_yaml(cls, path: Optional[Path] = None) -> "Config":
@@ -128,14 +137,17 @@ class Config:
         paths_raw = raw.get("paths", {})
         severity_raw = raw.get("severity", {})
 
+        aug_raw      = raw.get("augmentation", {})
+
         return cls(
-            model=ModelConfig(**model_raw),
-            training=TrainingConfig(**training_raw),
-            data=DataConfig(**data_raw),
-            paths=PathsConfig(**{k: Path(v) for k, v in paths_raw.items()}),
-            severity=SeverityConfig(
+            model        = ModelConfig(**model_raw),
+            training     = TrainingConfig(**training_raw),
+            data         = DataConfig(**data_raw),
+            paths        = PathsConfig(**{k: Path(v) for k, v in paths_raw.items()}),
+            severity     = SeverityConfig(
                 **{k: tuple(v) for k, v in severity_raw.items()}
             ),
+            augmentation = AugmentationConfig(**aug_raw),
         )
 
     def dq_label(self, dq: float) -> str:

@@ -1,297 +1,413 @@
 """
 src/data/mri_loader.py
-NIfTI loading and slice extraction for Baby Open Brains (BIDS) dataset.
-Handles T1w/T2w selection by age, center-of-mass slicing, and augmentation.
+=======================
+MRI preprocessing pipeline for EarlyMind.
+
+Reads Baby Open Brains (ds004797) T2w NIfTI volumes, extracts three
+central canonical slices (axial, coronal, sagittal), normalises each to
+[0, 1], and saves them as .npz files.
+
+Also provides:
+  - simulate_delayed_myelination()  — for augmentation/notebook demos
+  - MRIDataset                      — PyTorch Dataset (real + augmented)
+
+Usage (standalone):
+    python -m src.data.mri_loader
+
+DVC stage:
+    python -c "from src.data.mri_loader import process_mri_dataset; \
+               from src.config import cfg; \
+               process_mri_dataset(cfg.paths.mri_raw, cfg.paths.mri_processed)"
 """
 from __future__ import annotations
 
-import warnings
+import json
+import logging
+import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
-from scipy.ndimage import center_of_mass, zoom
 
-from src.config import cfg
-from src.utils.label_utils import parse_mri_participants_tsv
-
-warnings.filterwarnings("ignore")
-
-SLICE_SIZE = cfg.data.mri_slice_size  # 64
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Core loading helpers
+# Developmental-quotient heuristic
+# ---------------------------------------------------------------------------
+# Baby Open Brains subjects are rat pups (~327–340 days old, weight 183–331 g).
+# The dataset simulates structural MRI in neonatal neuroscience; it has no
+# ground-truth human DQ scores.  We assign a *research-heuristic* DQ that is
+# based on body weight z-score relative to the cohort mean (heavier/larger
+# brain ↔ lower ID risk) and a small random seed so every rerun is
+# reproducible.  This is clearly labelled as a heuristic — real deployment
+# must use clinical DQ assessments.
+
+_DQ_SEED = 2024
+
+
+def _weight_to_dq(weight_g: float, cohort_weights: np.ndarray, rng: np.random.Generator) -> float:
+    """
+    Map body weight z-score → DQ in [0, 100] with realistic noise.
+
+    Higher weight → closer to 'typical' (DQ ≈ 85–100).
+    Lower weight  → shifted toward borderline/mild ID risk (DQ ≈ 55–80).
+    """
+    mu, sigma = cohort_weights.mean(), cohort_weights.std() + 1e-6
+    z = (weight_g - mu) / sigma          # z-score relative to cohort
+    # DQ = 80 + 10*z, clamped to [35, 100], with ±5 research noise
+    dq_raw = 80.0 + 10.0 * z
+    dq_noisy = dq_raw + rng.normal(0.0, 5.0)
+    return float(np.clip(dq_noisy, 35.0, 100.0))
+
+
+def _dq_to_label(dq: float) -> int:
+    """Convert DQ float → integer class label (0 = typical, 5 = profound)."""
+    if dq >= 85:
+        return 0   # Typical
+    elif dq >= 70:
+        return 1   # Borderline
+    elif dq >= 55:
+        return 2   # Mild ID Risk
+    elif dq >= 35:
+        return 3   # Moderate ID Risk
+    elif dq >= 20:
+        return 4   # Severe ID Risk
+    else:
+        return 5   # Profound ID Risk
+
+
+# ---------------------------------------------------------------------------
+# NIfTI helpers (nibabel optional — falls back to raw gz read)
 # ---------------------------------------------------------------------------
 
-def load_nifti(nii_path: str | Path) -> np.ndarray:
-    """
-    Load a NIfTI file and return a float32 3D numpy array.
-    Squeezes any extra dimensions (e.g. 4D → 3D by taking first volume).
-    """
-    img = nib.load(str(nii_path))
-    vol = img.get_fdata(dtype=np.float32)
-    while vol.ndim > 3:
-        vol = vol[..., 0]
-    return vol
-
-
-def normalize_volume(vol: np.ndarray) -> np.ndarray:
-    """Intensity normalization to [0, 1]."""
-    vmin, vmax = vol.min(), vol.max()
-    return (vol - vmin) / (vmax - vmin + 1e-8)
-
-
-def _resize_slice(slc: np.ndarray, target: int = SLICE_SIZE) -> np.ndarray:
-    """Resize a 2D slice to (target, target) using scipy zoom."""
-    h, w = slc.shape
-    zh = target / h
-    zw = target / w
-    resized = zoom(slc, (zh, zw), order=1)
-    # Clip to exact size in case of rounding
-    resized = resized[:target, :target]
-    if resized.shape[0] < target:
-        pad = np.zeros((target - resized.shape[0], resized.shape[1]), dtype=np.float32)
-        resized = np.vstack([resized, pad])
-    if resized.shape[1] < target:
-        pad = np.zeros((resized.shape[0], target - resized.shape[1]), dtype=np.float32)
-        resized = np.hstack([resized, pad])
-    return resized.astype(np.float32)
-
-
-def extract_slices(vol: np.ndarray) -> np.ndarray:
-    """
-    Extract axial, coronal, sagittal slices at the center of mass.
-    Returns: (3, SLICE_SIZE, SLICE_SIZE) float32 array.
-    """
-    vol = normalize_volume(vol)
-
-    # Center of mass (only on nonzero voxels for robustness)
-    binary = vol > 0.1
-    if binary.sum() == 0:
-        binary = np.ones_like(vol, dtype=bool)
-
+def _load_nifti_volume(nii_path: Path) -> np.ndarray:
+    """Return 3-D float32 array from a NIfTI / NIfTI.gz file."""
     try:
-        cx, cy, cz = [int(round(v)) for v in center_of_mass(binary)]
-    except Exception:
-        cx = vol.shape[0] // 2
-        cy = vol.shape[1] // 2
-        cz = vol.shape[2] // 2
+        import nibabel as nib  # type: ignore
+        img = nib.load(str(nii_path))
+        data = np.asarray(img.get_fdata(), dtype=np.float32)
+        return data
+    except ImportError:
+        pass
 
-    # Clamp indices
-    cx = max(0, min(cx, vol.shape[0] - 1))
-    cy = max(0, min(cy, vol.shape[1] - 1))
-    cz = max(0, min(cz, vol.shape[2] - 1))
+    # Fallback: read raw compressed NIfTI (gzip) manually.
+    # NIfTI1 layout: 348-byte header, then voxel data (little-endian float32).
+    import gzip
+    import struct
 
-    axial    = vol[cx, :, :]   # (Y, Z)
-    coronal  = vol[:, cy, :]   # (X, Z)
-    sagittal = vol[:, :, cz]   # (X, Y)
+    with gzip.open(str(nii_path), "rb") as fh:
+        raw = fh.read()
 
-    axial    = _resize_slice(axial)
-    coronal  = _resize_slice(coronal)
-    sagittal = _resize_slice(sagittal)
+    # Read dims from header bytes 40–55 (short[8], little-endian)
+    dims = struct.unpack_from("<8h", raw, 40)
+    ndim = dims[0]
+    shape = tuple(dims[1 : ndim + 1])
 
-    return np.stack([axial, coronal, sagittal], axis=0)  # (3, 64, 64)
+    # Data offset from vox_offset field (byte 108, float32)
+    (vox_offset,) = struct.unpack_from("<f", raw, 108)
+    offset = int(vox_offset) if vox_offset >= 348 else 352
+
+    # datatype field (byte 70, short)
+    (dtype_code,) = struct.unpack_from("<h", raw, 70)
+    dtype_map = {2: np.uint8, 4: np.int16, 8: np.int32, 16: np.float32, 64: np.float64}
+    dtype = dtype_map.get(dtype_code, np.float32)
+
+    n_voxels = int(np.prod(shape))
+    data = np.frombuffer(raw[offset : offset + n_voxels * np.dtype(dtype).itemsize], dtype=dtype)
+    data = data.reshape(shape, order="F").astype(np.float32)
+    return data
 
 
-# ---------------------------------------------------------------------------
-# BIDS file discovery
-# ---------------------------------------------------------------------------
-
-def find_structural_scan(
-    subject_dir: Path,
-    age_months: float,
-    prefer_t2w: bool = False,
-) -> Optional[Path]:
+def _extract_central_slices(vol: np.ndarray, size: int = 64) -> np.ndarray:
     """
-    Find the appropriate structural scan (T1w or T2w) for a BIDS subject.
+    Extract the central axial, coronal, and sagittal slices from a 3-D volume.
 
-    For infants < 12 months: prefer T2w (inverted contrast).
-    For subjects >= 12 months: prefer T1w.
-
-    Looks under sub-XX/ses-*/anat/ and sub-XX/anat/.
+    Returns shape (3, size, size) — float32, normalised to [0, 1].
     """
-    use_t2w = prefer_t2w or (age_months < 12.0)
-    preferred = "T2w" if use_t2w else "T1w"
-    fallback  = "T1w" if use_t2w else "T2w"
+    # Ensure at least 3 spatial dims; drop time dim if 4-D (fMRI)
+    if vol.ndim == 4:
+        vol = vol[..., vol.shape[3] // 2]
 
-    def _search(modality: str) -> Optional[Path]:
-        patterns = [
-            f"**/*_{modality}.nii.gz",
-            f"**/*_{modality}.nii",
-        ]
-        for pat in patterns:
-            hits = sorted([p for p in subject_dir.glob(pat) if not p.name.startswith("._")])
-            if hits:
-                return hits[0]
-        return None
+    x, y, z = vol.shape
 
-    scan = _search(preferred)
-    if scan is None:
-        scan = _search(fallback)
-    return scan
+    def _centre_crop(img_2d: np.ndarray) -> np.ndarray:
+        """Resize 2-D slice to (size, size) via naive zoom (no scipy dep)."""
+        try:
+            from scipy.ndimage import zoom  # type: ignore
+            scale_h = size / img_2d.shape[0]
+            scale_w = size / img_2d.shape[1]
+            return zoom(img_2d, (scale_h, scale_w), order=1).astype(np.float32)
+        except ImportError:
+            pass
+        # Very lightweight nearest-neighbour fallback
+        rows = np.linspace(0, img_2d.shape[0] - 1, size).astype(int)
+        cols = np.linspace(0, img_2d.shape[1] - 1, size).astype(int)
+        return img_2d[np.ix_(rows, cols)].astype(np.float32)
+
+    axial    = _centre_crop(vol[x // 2, :, :])   # fixed x
+    coronal  = _centre_crop(vol[:, y // 2, :])   # fixed y
+    sagittal = _centre_crop(vol[:, :, z // 2])   # fixed z
+
+    slices = np.stack([axial, coronal, sagittal], axis=0)   # (3, H, W)
+
+    # Normalise each slice independently to [0, 1]
+    for i in range(3):
+        vmin, vmax = slices[i].min(), slices[i].max()
+        if vmax > vmin:
+            slices[i] = (slices[i] - vmin) / (vmax - vmin)
+        else:
+            slices[i] = np.zeros_like(slices[i])
+
+    return slices
 
 
 # ---------------------------------------------------------------------------
-# Dataset-level preprocessing
+# Myelination delay simulation (used by augmenter + notebook demos)
+# ---------------------------------------------------------------------------
+
+def simulate_delayed_myelination(
+    slices: np.ndarray,
+    severity: float = 0.5,
+    rng: Optional[np.random.Generator] = None,
+) -> np.ndarray:
+    """
+    Simulate white-matter myelination delay by selectively blurring
+    high-intensity regions (white matter) in the MRI slices.
+
+    Parameters
+    ----------
+    slices   : (3, H, W) float32 normalised to [0, 1]
+    severity : 0 = no effect, 1 = maximum delay (very blurred WM)
+    rng      : numpy random generator (for reproducibility)
+
+    Returns
+    -------
+    (3, H, W) float32 — augmented slices
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    from scipy.ndimage import gaussian_filter  # type: ignore
+
+    out = slices.copy()
+    sigma = severity * rng.uniform(1.5, 3.5)
+
+    for i in range(3):
+        blurred = gaussian_filter(out[i], sigma=sigma).astype(np.float32)
+        # Only affect the bright (white-matter) voxels
+        wm_mask = out[i] > 0.6
+        out[i] = np.where(wm_mask, blurred, out[i])
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main processing function
 # ---------------------------------------------------------------------------
 
 def process_mri_dataset(
-    mri_dir: str | Path,
-    output_dir: str | Path,
+    mri_dir: Path,
+    output_dir: Path,
+    slice_size: int = 64,
 ) -> Dict[str, dict]:
     """
-    Process all subjects in a BIDS MRI directory.
-    Saves: output_dir/sub-XX.npy — (3, 64, 64) float32 slice array.
+    Preprocess all T2w NIfTI volumes in *mri_dir* and save as .npz to
+    *output_dir*.
 
-    Returns dict: {participant_id: {"slices": ..., "label": ..., "dq": ..., "age_months": ...}}
+    Each .npz contains:
+      slices      : float32 (3, slice_size, slice_size)
+      dq          : float scalar — heuristic developmental quotient
+      label       : int scalar  — DQ severity class 0–5
+      age_months  : float scalar
+      subject_id  : str
+
+    Returns a dict {subject_id: {slices, dq, label, age_months}}.
     """
-    mri_dir   = Path(mri_dir)
+    mri_dir = Path(mri_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse participants.tsv for ages + labels
+    log.info("MRI loader: scanning %s", mri_dir)
+
+    # ------------------------------------------------------------------
+    # 1. Collect subjects + parse participants.tsv
+    # ------------------------------------------------------------------
+    subj_dirs = sorted(d for d in mri_dir.iterdir() if d.is_dir() and d.name.startswith("sub-"))
+    if not subj_dirs:
+        raise FileNotFoundError(f"No sub-XX directories found in {mri_dir}")
+
     participants_tsv = mri_dir / "participants.tsv"
-    label_df = None
+    meta: Dict[str, dict] = {}
+
     if participants_tsv.exists():
-        try:
-            label_df = parse_mri_participants_tsv(str(participants_tsv))
-        except Exception as e:
-            print(f"  [WARNING] Could not parse participants.tsv: {e}")
+        import csv
+        with open(participants_tsv, newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            for row in reader:
+                pid = row.get("participant_id", "").strip()
+                if not pid:
+                    continue
+                try:
+                    age_days = float(row.get("Age (days)", 0) or 0)
+                except ValueError:
+                    age_days = 330.0
+                try:
+                    weight_g = float(row.get("Weight (g)", 250) or 250)
+                except ValueError:
+                    weight_g = 250.0
+                meta[pid] = {
+                    "age_days": age_days,
+                    "age_months": age_days / 30.44,
+                    "weight_g": weight_g,
+                }
 
-    # Build subject → age_months map
-    age_map: Dict[str, float] = {}
-    label_map: Dict[str, Tuple[int, float]] = {}
-    if label_df is not None:
-        for _, row in label_df.iterrows():
-            pid = str(row["participant_id"]).strip()
-            age_map[pid]   = float(row["age_months"])
-            label_map[pid] = (int(row["label"]), float(row["dq"]))
+    # Collect weights for cohort-level z-score
+    all_weights = np.array([v["weight_g"] for v in meta.values()], dtype=np.float32)
+    if len(all_weights) == 0:
+        all_weights = np.array([250.0])
 
-    # Discover subject directories
-    subject_dirs = sorted(
-        [d for d in mri_dir.iterdir()
-         if d.is_dir() and d.name.startswith("sub-")]
-    )
-    if len(subject_dirs) == 0:
-        raise FileNotFoundError(f"No sub-* directories found in {mri_dir}")
+    rng = np.random.default_rng(_DQ_SEED)
 
-    results = {}
+    # ------------------------------------------------------------------
+    # 2. Process each subject
+    # ------------------------------------------------------------------
+    results: Dict[str, dict] = {}
 
-    for subj_dir in subject_dirs:
+    for subj_dir in subj_dirs:
         pid = subj_dir.name  # e.g. "sub-01"
-        age_months = age_map.get(pid, 6.0)  # default 6 months
-        label, dq  = label_map.get(pid, (0, 90.0))
 
-        print(f"  Processing MRI subject: {pid}, age={age_months:.1f}mo")
-
-        scan_path = find_structural_scan(subj_dir, age_months)
-        if scan_path is None:
-            print(f"    [WARNING] No structural scan found for {pid}, skipping.")
+        # Prefer T2w (clearer for neonatal myelin), fall back to BOLD mean
+        nii_candidates = (
+            list(subj_dir.glob("**/anat/*T2w.nii.gz"))
+            + list(subj_dir.glob("**/anat/*T1w.nii.gz"))
+            + list(subj_dir.glob("**/func/*bold.nii.gz"))
+        )
+        if not nii_candidates:
+            log.warning("No NIfTI found for %s — skipping", pid)
             continue
+
+        nii_path = nii_candidates[0]
+        log.info("Processing %s from %s", pid, nii_path.name)
 
         try:
-            vol    = load_nifti(scan_path)
-            slices = extract_slices(vol)   # (3, 64, 64)
-        except Exception as e:
-            print(f"    [ERROR] Failed to process {pid}: {e}")
+            vol = _load_nifti_volume(nii_path)
+        except Exception as exc:
+            log.error("Failed to load %s: %s", nii_path, exc)
             continue
 
-        out_path = output_dir / f"{pid}.npy"
-        np.save(str(out_path), slices)
+        slices = _extract_central_slices(vol, size=slice_size)  # (3, 64, 64)
+
+        # Subject metadata
+        subj_meta = meta.get(pid, {"age_days": 330.0, "age_months": 10.8, "weight_g": 250.0})
+        dq = _weight_to_dq(subj_meta["weight_g"], all_weights, rng)
+        label = _dq_to_label(dq)
+
+        out_path = output_dir / f"{pid}.npz"
+        np.savez_compressed(
+            out_path,
+            slices=slices,
+            dq=np.float32(dq),
+            label=np.int32(label),
+            age_months=np.float32(subj_meta["age_months"]),
+            subject_id=np.bytes_(pid),
+        )
 
         results[pid] = {
             "slices": slices,
-            "label": label,
             "dq": dq,
-            "age_months": age_months,
-            "scan_path": str(scan_path),
-            "out_path": str(out_path),
+            "label": label,
+            "age_months": subj_meta["age_months"],
         }
+        log.info("  ✓ %s → DQ=%.1f, label=%d", pid, dq, label)
 
-    print(f"  MRI preprocessing complete: {len(results)} subjects → {output_dir}")
+    log.info("MRI preprocessing complete: %d subjects saved to %s", len(results), output_dir)
     return results
 
 
 # ---------------------------------------------------------------------------
-# MRI Augmentation helpers (for training)
+# PyTorch Dataset
 # ---------------------------------------------------------------------------
 
-def augment_mri_slices(
-    slices: np.ndarray,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
+class MRIDataset:
     """
-    Apply random augmentations to a (3, 64, 64) MRI slice array.
-    Returns augmented copy of same shape.
+    torch.utils.data.Dataset-compatible loader for MRI slice stacks.
+
+    Parameters
+    ----------
+    real_dir       : path to datasets/processed/mri (10 real .npz files)
+    augmented_dir  : path to datasets/mri/augmented (optional synthetic pool)
+    use_augmented  : whether to include synthetic samples
+    transform      : optional callable applied to each (3,H,W) slice array
     """
-    from scipy.ndimage import gaussian_filter, rotate
 
-    if rng is None:
-        rng = np.random.default_rng()
+    def __init__(
+        self,
+        real_dir: Path,
+        augmented_dir: Optional[Path] = None,
+        use_augmented: bool = True,
+        transform=None,
+    ):
+        real_dir = Path(real_dir)
+        self._files = sorted(real_dir.glob("*.npz"))
 
-    x = slices.copy().astype(np.float32)  # (3, 64, 64)
+        if use_augmented and augmented_dir is not None:
+            aug_dir = Path(augmented_dir)
+            if aug_dir.exists():
+                self._files += sorted(aug_dir.glob("*.npz"))
+            else:
+                log.warning("Augmented dir %s not found — using real data only", aug_dir)
 
-    # 1. Random horizontal flip
-    if rng.random() > 0.5:
-        x = x[:, :, ::-1].copy()
+        if not self._files:
+            raise FileNotFoundError(f"No .npz files found in {real_dir}")
 
-    # 2. Random rotation ±10 degrees
-    angle = rng.uniform(-10, 10)
-    x = np.stack([
-        rotate(x[i], angle, reshape=False, mode="reflect")
-        for i in range(x.shape[0])
-    ], axis=0)
+        self.transform = transform
+        log.info("MRIDataset: %d samples loaded", len(self._files))
 
-    # 3. Gaussian blur
-    sigma = rng.uniform(0.1, 2.0)
-    x = np.stack([
-        gaussian_filter(x[i], sigma=sigma)
-        for i in range(x.shape[0])
-    ], axis=0)
+    # Make it usable without torch imported
+    def __len__(self) -> int:
+        return len(self._files)
 
-    # 4. Random intensity scaling
-    scale = rng.uniform(0.85, 1.15)
-    x = x * scale
+    def __getitem__(self, idx: int) -> Tuple[np.ndarray, float, int]:
+        data = np.load(self._files[idx], allow_pickle=True)
+        slices = data["slices"].astype(np.float32)   # (3, 64, 64)
+        dq     = float(data["dq"])
+        label  = int(data["label"])
 
-    # 5. Random crop and resize back to 64×64
-    crop_px = int(rng.integers(0, 8))  # crop 0–7 pixels on each side
-    if crop_px > 0:
-        _, H, W = x.shape
-        x_crop = x[:, crop_px:H-crop_px, crop_px:W-crop_px]
-        x = np.stack([
-            _resize_slice(x_crop[i], SLICE_SIZE)
-            for i in range(x_crop.shape[0])
-        ], axis=0)
+        if self.transform is not None:
+            slices = self.transform(slices)
 
-    # Clip to [0, 1]
-    x = np.clip(x, 0.0, 1.0)
-    return x.astype(np.float32)
+        return slices, dq, label
+
+    # Convenience: summary stats
+    def label_distribution(self) -> dict:
+        counts = {i: 0 for i in range(6)}
+        names  = {0: "Typical", 1: "Borderline", 2: "Mild ID",
+                  3: "Moderate ID", 4: "Severe ID", 5: "Profound ID"}
+        for f in self._files:
+            d = np.load(f, allow_pickle=True)
+            counts[int(d["label"])] += 1
+        return {names[k]: v for k, v in counts.items()}
 
 
-def simulate_delayed_myelination(
-    slices: np.ndarray,
-    rng: Optional[np.random.Generator] = None,
-) -> np.ndarray:
-    """
-    Apply augmentations that simulate delayed myelination appearance.
-    Used for pretraining the MRI encoder with synthetic 'ID-risk' label.
-    """
-    from scipy.ndimage import gaussian_filter
+# ---------------------------------------------------------------------------
+# CLI entry-point
+# ---------------------------------------------------------------------------
 
-    if rng is None:
-        rng = np.random.default_rng()
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
-    x = slices.copy().astype(np.float32)
+    # Allow running from repo root or src/
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-    # Stronger blurring (simulates unmyelinated white matter contrast loss)
-    sigma = rng.uniform(1.5, 3.5)
-    x = np.stack([gaussian_filter(x[i], sigma=sigma) for i in range(x.shape[0])], axis=0)
+    from src.config import cfg  # type: ignore
 
-    # Intensity shift (reduces WM/GM contrast)
-    x = x * rng.uniform(0.7, 0.9) + rng.uniform(0.05, 0.15)
-
-    # Re-normalize to [0, 1]
-    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
-    return x.astype(np.float32)
+    results = process_mri_dataset(
+        mri_dir=cfg.paths.mri_raw,
+        output_dir=cfg.paths.mri_processed,
+        slice_size=cfg.data.mri_slice_size,
+    )
+    print(f"\n✅  Saved {len(results)} MRI samples to {cfg.paths.mri_processed}")
+    for pid, info in results.items():
+        print(f"   {pid}: DQ={info['dq']:.1f}  label={info['label']}  age={info['age_months']:.1f}mo")

@@ -1,11 +1,83 @@
-datasets/eeg/helsinki_neonatal/
-datasets/mri/baby_open_brains/
-datasets/facial/hpo/
-datasets/processed/
-checkpoints/
+# =============================================================================
+# EarlyMind — .gitignore
+# Large binaries (checkpoints, datasets) are distributed via GitHub Releases.
+# =============================================================================
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 *.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter / IPython
 .ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# Logs
+*.log
+backend.log
+docs.log
+frontend.log
+
+# Large ML artifacts — distributed via GitHub Releases
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Raw and processed datasets — distributed via GitHub Releases / DVC
+datasets/
+*.tar.gz
+*.zip
+datasets.zip
+eeg_raw.tar.gz
+mri_raw.tar.gz
+facial_raw.tar.gz
+
+# Raw MRI NIfTI files (624 MB — bundled in mri_raw.tar.gz release asset)
+baby_open_brains/
+*.nii.gz
+*.nii
+
+# Raw EEG binary files
+*.edf
+
+# Raw HPO annotation files
+*.hpoa
+
+# DVC cache and run outputs
+.dvc/cache/
+.dvc/tmp/
+.dvcignore
+
+# Reports (generated at runtime)
+reports/
+
+# Environment
 .env
+.env.local
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/secrets.toml
